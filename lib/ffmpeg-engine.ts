@@ -3,10 +3,13 @@
 import { FFmpeg } from "@ffmpeg/ffmpeg"
 import { fetchFile, toBlobURL } from "@ffmpeg/util"
 
-// Single-threaded core — works everywhere as long as COOP/COEP headers are set,
-// and keeps the bundle light (~30 MB wasm vs ~60 MB for the MT version).
-const CORE_VERSION = "0.12.10"
-const CORE_BASE = `https://unpkg.com/@ffmpeg/core@${CORE_VERSION}/dist/umd`
+// Single-threaded UMD core. Does NOT require SharedArrayBuffer, so it works
+// in any context (no COOP/COEP headers needed).
+const CORE_VERSION = "0.12.6"
+const CDNS = [
+  `https://unpkg.com/@ffmpeg/core@${CORE_VERSION}/dist/umd`,
+  `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${CORE_VERSION}/dist/umd`,
+]
 
 let ffmpegSingleton: FFmpeg | null = null
 let loadingPromise: Promise<FFmpeg> | null = null
@@ -29,14 +32,38 @@ export type TransitionType =
 export interface TransitionOptions {
   frameA: File | Blob
   frameB: File | Blob
-  durationSec: number // total output duration
+  durationSec: number
   fps: number
   width: number
   height: number
   transition: TransitionType
-  kenBurns: boolean // subtle in/out zoom on each frame
+  kenBurns: boolean
   onProgress?: (ratio: number) => void
   onLog?: (line: string) => void
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms)
+    promise.then(
+      (v) => {
+        clearTimeout(timer)
+        resolve(v)
+      },
+      (e) => {
+        clearTimeout(timer)
+        reject(e)
+      },
+    )
+  })
+}
+
+async function loadCoreFromCdn(base: string): Promise<{ coreURL: string; wasmURL: string }> {
+  const [coreURL, wasmURL] = await Promise.all([
+    withTimeout(toBlobURL(`${base}/ffmpeg-core.js`, "text/javascript"), 60_000, `fetch core JS from ${base}`),
+    withTimeout(toBlobURL(`${base}/ffmpeg-core.wasm`, "application/wasm"), 120_000, `fetch core WASM from ${base}`),
+  ])
+  return { coreURL, wasmURL }
 }
 
 export async function loadFFmpeg(onLog?: (line: string) => void): Promise<FFmpeg> {
@@ -45,26 +72,48 @@ export async function loadFFmpeg(onLog?: (line: string) => void): Promise<FFmpeg
 
   loadingPromise = (async () => {
     const ffmpeg = new FFmpeg()
-    if (onLog) {
-      ffmpeg.on("log", ({ message }) => onLog(message))
-    }
-    await ffmpeg.load({
-      coreURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, "text/javascript"),
-      wasmURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
+
+    // Always forward logs through whatever listener is supplied by the caller.
+    // We use a mutable ref so subsequent generations can swap the listener.
+    ffmpeg.on("log", ({ message }) => {
+      console.log("[v0] ffmpeg:", message)
     })
+
+    let urls: { coreURL: string; wasmURL: string } | null = null
+    let lastErr: unknown = null
+    for (const base of CDNS) {
+      try {
+        console.log("[v0] loading ffmpeg core from", base)
+        urls = await loadCoreFromCdn(base)
+        break
+      } catch (e) {
+        console.warn("[v0] CDN failed, trying next:", base, e)
+        lastErr = e
+      }
+    }
+    if (!urls) throw new Error(`Unable to download FFmpeg core: ${(lastErr as Error)?.message ?? "unknown"}`)
+
+    try {
+      await withTimeout(ffmpeg.load(urls), 60_000, "ffmpeg.load()")
+    } catch (e) {
+      loadingPromise = null
+      throw new Error(`FFmpeg failed to initialise: ${(e as Error)?.message ?? e}`)
+    }
+
+    if (onLog) ffmpeg.on("log", ({ message }) => onLog(message))
     ffmpegSingleton = ffmpeg
     return ffmpeg
   })()
 
-  return loadingPromise
+  try {
+    return await loadingPromise
+  } catch (e) {
+    // Reset so the next attempt can retry from scratch.
+    loadingPromise = null
+    throw e
+  }
 }
 
-/**
- * Build the filter_complex string that:
- *  1. normalises each image to the target canvas (letterbox),
- *  2. optionally applies a subtle Ken Burns (zoom in on A, zoom out on B),
- *  3. xfades A into B with the chosen transition.
- */
 function buildFilterComplex(opts: {
   width: number
   height: number
@@ -79,18 +128,14 @@ function buildFilterComplex(opts: {
   const framesA = Math.round((offsetSec + xfadeSec) * fps)
   const framesB = Math.round((totalSec - offsetSec) * fps)
 
-  // Prepare each stream: fit-to-canvas on pure black, lock SAR, set fps.
   const prep = (idx: 0 | 1, frames: number, zoomDir: "in" | "out") => {
     const base =
       `[${idx}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
       `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=${fps}`
     if (!kenBurns) return `${base}[v${idx}]`
-    // Gentle Ken Burns: z goes from 1.00 → 1.06 (in) or 1.06 → 1.00 (out).
-    // Using zoompan with a trivial motion keeps the subject centred.
+    const step = (0.06 / Math.max(frames - 1, 1)).toFixed(6)
     const zExpr =
-      zoomDir === "in"
-        ? `min(1.001+on*${(0.06 / Math.max(frames - 1, 1)).toFixed(6)},1.06)`
-        : `max(1.06-on*${(0.06 / Math.max(frames - 1, 1)).toFixed(6)},1.001)`
+      zoomDir === "in" ? `min(1.001+on*${step}\\,1.06)` : `max(1.06-on*${step}\\,1.001)`
     return (
       `${base},zoompan=z='${zExpr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':` +
       `d=${frames}:s=${width}x${height}:fps=${fps}[v${idx}]`
@@ -105,22 +150,24 @@ function buildFilterComplex(opts: {
 }
 
 export async function generateTransition(opts: TransitionOptions): Promise<Blob> {
-  const ffmpeg = await loadFFmpeg(opts.onLog)
+  const ffmpeg = await loadFFmpeg()
 
   const { durationSec, fps, width, height, transition, kenBurns } = opts
 
-  // Timeline split: short pre-hold, long smooth blend, short post-hold.
   const preHold = Math.max(0.25, durationSec * 0.15)
   const postHold = Math.max(0.25, durationSec * 0.15)
   const xfadeSec = Math.max(0.5, durationSec - preHold - postHold)
   const inputASec = preHold + xfadeSec
   const inputBSec = xfadeSec + postHold
 
-  // Forward ffmpeg's internal progress (0..1 of the encode).
   const progressHandler = ({ progress }: { progress: number }) => {
     opts.onProgress?.(Math.max(0, Math.min(1, progress)))
   }
+  const logHandler = ({ message }: { message: string }) => {
+    opts.onLog?.(message)
+  }
   ffmpeg.on("progress", progressHandler)
+  ffmpeg.on("log", logHandler)
 
   try {
     await ffmpeg.writeFile("a.png", await fetchFile(opts.frameA))
@@ -151,17 +198,21 @@ export async function generateTransition(opts: TransitionOptions): Promise<Blob>
       "out.mp4",
     ]
 
-    await ffmpeg.exec(args)
+    console.log("[v0] ffmpeg exec:", args.join(" "))
+    const exitCode = await ffmpeg.exec(args)
+    console.log("[v0] ffmpeg exit code:", exitCode)
+    if (exitCode !== 0) {
+      throw new Error(`FFmpeg exited with code ${exitCode}. Check browser console for details.`)
+    }
 
     const data = await ffmpeg.readFile("out.mp4")
     const uint8 = data as Uint8Array
-    // Copy into a fresh buffer so the Blob is detached from FFmpeg's heap.
     const buffer = new ArrayBuffer(uint8.byteLength)
     new Uint8Array(buffer).set(uint8)
     return new Blob([buffer], { type: "video/mp4" })
   } finally {
     ffmpeg.off("progress", progressHandler)
-    // Clean the virtual FS so the next run starts fresh.
+    ffmpeg.off("log", logHandler)
     try {
       await ffmpeg.deleteFile("a.png")
       await ffmpeg.deleteFile("b.png")
@@ -172,7 +223,6 @@ export async function generateTransition(opts: TransitionOptions): Promise<Blob>
   }
 }
 
-/** Read an image file and return its natural dimensions. */
 export function readImageDimensions(file: File | Blob): Promise<{ width: number; height: number }> {
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file)

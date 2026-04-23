@@ -1,17 +1,8 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  async headers() {
-    // FFmpeg.wasm requires SharedArrayBuffer, which needs these COOP/COEP headers.
-    return [
-      {
-        source: "/(.*)",
-        headers: [
-          { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
-          { key: "Cross-Origin-Embedder-Policy", value: "require-corp" },
-        ],
-      },
-    ]
-  },
+  // FFmpeg.wasm single-threaded core does NOT require SharedArrayBuffer,
+  // so we intentionally do NOT set COOP/COEP headers here — they can break
+  // cross-origin resource loading inside preview iframes.
 }
 
 export default nextConfig
